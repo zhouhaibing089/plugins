@@ -48,6 +48,7 @@ type NetConf struct {
 	MTU          int    `json:"mtu"`
 	HairpinMode  bool   `json:"hairpinMode"`
 	PromiscMode  bool   `json:"promiscMode"`
+	ProxyArp     bool   `json:"proxyArp"`
 }
 
 type gwInfo struct {
@@ -205,7 +206,7 @@ func bridgeByName(name string) (*netlink.Bridge, error) {
 	return br, nil
 }
 
-func ensureBridge(brName string, mtu int, promiscMode bool) (*netlink.Bridge, error) {
+func ensureBridge(brName string, mtu int, promiscMode bool, proxyArp bool) (*netlink.Bridge, error) {
 	br := &netlink.Bridge{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: brName,
@@ -226,6 +227,16 @@ func ensureBridge(brName string, mtu int, promiscMode bool) (*netlink.Bridge, er
 	if promiscMode {
 		if err := netlink.SetPromiscOn(br); err != nil {
 			return nil, fmt.Errorf("could not set promiscuous mode on %q: %v", brName, err)
+		}
+	}
+
+	// In case the address assigned to container is in the same network as the
+	// host then it would be necessary to enable proxy arp so it can be access
+	// by external hosts.
+	if proxyArp {
+		err = ioutil.WriteFile(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", brName), []byte("1"), 0644)
+		if err != nil {
+			return nil, fmt.Errorf("could not set proxy arp for %q: %s", brName, err)
 		}
 	}
 
@@ -290,7 +301,7 @@ func calcGatewayIP(ipn *net.IPNet) net.IP {
 
 func setupBridge(n *NetConf) (*netlink.Bridge, *current.Interface, error) {
 	// create bridge if necessary
-	br, err := ensureBridge(n.BrName, n.MTU, n.PromiscMode)
+	br, err := ensureBridge(n.BrName, n.MTU, n.PromiscMode, n.ProxyArp)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create bridge %q: %v", n.BrName, err)
 	}
@@ -444,6 +455,23 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
+	// add an additional route rule on the host
+	if n.ProxyArp {
+		for _, ipc := range result.IPs {
+			err = netlink.RouteAdd(&netlink.Route{
+				LinkIndex: br.Attrs().Index,
+				Scope:     netlink.SCOPE_LINK,
+				Dst: &net.IPNet{
+					IP:   ipc.Address.IP,
+					Mask: net.IPv4Mask(255, 255, 255, 255),
+				},
+			})
+			if err != nil && err != syscall.EEXIST {
+				return fmt.Errorf("failed to add route for %s: %s", ipc.Address, err)
+			}
+		}
+	}
+
 	// Refetch the bridge since its MAC address may change when the first
 	// veth is added or after its IP address is set
 	br, err = bridgeByName(n.BrName)
@@ -494,6 +522,27 @@ func cmdDel(args *skel.CmdArgs) error {
 		for _, ipn := range ipnets {
 			if err := ip.TeardownIPMasq(ipn, chain, comment); err != nil {
 				return err
+			}
+		}
+	}
+
+	br, err := netlink.LinkByName(n.BrName)
+	if err != nil {
+		return err
+	}
+
+	if n.ProxyArp {
+		for _, ipn := range ipnets {
+			err = netlink.RouteDel(&netlink.Route{
+				LinkIndex: br.Attrs().Index,
+				Scope:     netlink.SCOPE_LINK,
+				Dst: &net.IPNet{
+					IP:   ipn.IP,
+					Mask: net.IPv4Mask(255, 255, 255, 255),
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("failed to delete route for %s", ipn.String())
 			}
 		}
 	}
