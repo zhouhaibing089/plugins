@@ -20,7 +20,7 @@ export GO="${GO:-go}"
 mkdir -p "${PWD}/bin"
 
 echo "Building plugins"
-PLUGINS="plugins/meta/* plugins/main/* plugins/ipam/* plugins/sample"
+PLUGINS="plugins/meta/* plugins/main/* plugins/ipam/* plugins/ipam/remote/server plugins/sample"
 for d in $PLUGINS; do
 	if [ -d "$d" ]; then
 		plugin="$(basename "$d")"
